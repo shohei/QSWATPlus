@@ -44,7 +44,7 @@ class Parameters:
     _ISWIN = platform.system() == 'Windows'
     _ISLINUX = platform.system() == 'Linux'
     _ISMAC = platform.system() == 'Darwin'
-    _MACQGISDIR = '/Applications/QGIS-LTR.app'
+    _MACQGISDIR = '/Applications/QGIS-LTR.app' if os.path.isdir('/Applications/QGIS-LTR.app') else '/Applications/QGIS.app'
     _HOMEDIR = os.path.expanduser('~')
     _SWATPLUSDEFAULTDIR = _HOMEDIR + r'\SWATPlus' if _ISWIN else _HOMEDIR + '/.local/share/SWATPlus' if _ISLINUX else _HOMEDIR + '/SWATPlus'
     if not os.path.isdir(_SWATPLUSDEFAULTDIR):
@@ -60,7 +60,7 @@ class Parameters:
     _TAUDEMDIR = 'TauDEM5Bin'
     _TAUDEMHELP = 'TauDEM_Tools.chm'  # not used in Linux or Mac
     _TAUDEMDOCS = 'http://hydrology.usu.edu/taudem/taudem5/documentation.html'
-    _SVGDIR = 'apps/qgis/svg' if _ISWIN else '/usr/share/qgis/svg' if _ISLINUX else '/Applications/QGIS-LTR.app/Contents/Resources/svg'
+    _SVGDIR = 'apps/qgis/svg' if _ISWIN else '/usr/share/qgis/svg' if _ISLINUX else _MACQGISDIR + '/Contents/Resources/svg'
     _DBDIR = 'Databases'
     _DBPROJ = 'QSWATPlusProj.sqlite'
     _DBREF = 'swatplus_datasets.sqlite'

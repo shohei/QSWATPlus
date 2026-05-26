@@ -229,7 +229,7 @@ class TauDEMUtils:
         # In windows PROJ seems to need ` instead of the more recent PROJ_DATA
         # In windows gdalplugins now stored under TauDEMDir so they are compatible with gdal304 dlls stored there
         MacPrefixNeeded = Parameters._ISMAC
-        MacPrefix = 'export DYLD_FALLBACK_LIBRARY_PATH={0}/Contents/MacOS/lib; export PROJ_LIB={0}/Contents/Resources/proj; '.format(Parameters._MACQGISDIR)
+        MacPrefix = 'export DYLD_FALLBACK_LIBRARY_PATH={0}/Contents/Frameworks; export PROJ_LIB={0}/Contents/Resources/qgis/proj; '.format(Parameters._MACQGISDIR)
         procCommand = commands if Parameters._ISWIN else MacPrefix + command if MacPrefixNeeded else command
         if Parameters._ISMAC:
             QSWATUtils.loginfo(procCommand)
