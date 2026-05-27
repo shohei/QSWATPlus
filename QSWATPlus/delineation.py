@@ -1905,7 +1905,10 @@ assumed that its crossing the lake boundary is an inaccuracy.
             return
         self._gv.felFile = felFile
         if self._dlg.checkBurn.isChecked() and burnFile:
-            TauDEMUtils.conditionFlatStreamCells(felFile, burnFile, self._gv.isBatch)
+            try:
+                TauDEMUtils.conditionFlatStreamCells(felFile, burnFile, self._gv.isBatch)
+            except Exception:
+                QSWATUtils.loginfo('conditionFlatStreamCells failed (non-fatal): {0}'.format(traceback.format_exc()))
         sd8File = base + 'sd8' + suffix
         pFile = base + 'p' + suffix
         QSWATUtils.removeLayer(sd8File, root)

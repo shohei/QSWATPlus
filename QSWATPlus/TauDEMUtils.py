@@ -203,8 +203,13 @@ class TauDEMUtils:
         Non-channel flat cells (plains, lakes) are left untouched so accumulation routing
         outside the reference stream is not disturbed.
         """
-        from scipy.ndimage import label as ndlabel
+        try:
+            from scipy.ndimage import label as ndlabel
+        except ImportError:
+            QSWATUtils.loginfo('conditionFlatStreamCells: scipy not available, skipping flat conditioning')
+            return
         start = time.process_time()
+        QSWATUtils.loginfo('conditionFlatStreamCells: starting on {0}'.format(felFile))
 
         felDs = gdal.Open(felFile, gdal.GA_Update)
         if felDs is None:
@@ -217,6 +222,7 @@ class TauDEMUtils:
         nRows = felDs.RasterYSize
         nCols = felDs.RasterXSize
         ox, px, _, oy, _, py = geotransform
+        QSWATUtils.loginfo('conditionFlatStreamCells: DEM size {0}x{1}, reading array'.format(nRows, nCols))
         fel = felBand.ReadAsArray().astype(np.float64)
 
         nodata_mask = np.zeros((nRows, nCols), dtype=bool)
@@ -224,6 +230,7 @@ class TauDEMUtils:
             nodata_mask = (np.abs(fel - float(felNodata)) < 1.0)
 
         # Flat cells: those where the 3x3 neighbourhood has identical min and max
+        QSWATUtils.loginfo('conditionFlatStreamCells: computing flat mask')
         padded = np.pad(fel, 1, constant_values=np.finfo(np.float64).max)
         min_nbr = np.minimum.reduce([
             padded[:-2, :-2], padded[:-2, 1:-1], padded[:-2, 2:],
@@ -237,6 +244,7 @@ class TauDEMUtils:
             padded_max[2:,   :-2], padded_max[2:,  1:-1], padded_max[2:,  2:]
         ])
         flat_mask = (~nodata_mask) & (max_nbr == min_nbr)
+        QSWATUtils.loginfo('conditionFlatStreamCells: flat cells={0}, loading stream layer'.format(int(flat_mask.sum())))
 
         # Rasterize reference stream; record normalised flow-direction vector per cell
         stream_dc = np.zeros((nRows, nCols), dtype=np.float64)  # east = +
@@ -244,6 +252,11 @@ class TauDEMUtils:
         stream_on_grid = np.zeros((nRows, nCols), dtype=bool)
 
         streamLayer = QgsVectorLayer(streamFile, 'FlatCond', 'ogr')
+        if not streamLayer.isValid():
+            QSWATUtils.loginfo('conditionFlatStreamCells: cannot load stream file {0}, skipping'.format(streamFile))
+            felDs = None
+            return
+        QSWATUtils.loginfo('conditionFlatStreamCells: rasterizing {0} stream features'.format(streamLayer.featureCount()))
         for reach in streamLayer.getFeatures():
             geom = reach.geometry()
             lines = geom.asMultiPolyline() if geom.isMultipart() else [geom.asPolyline()]

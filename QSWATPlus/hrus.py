@@ -1137,7 +1137,7 @@ class CreateHRUs(QObject):
             self.progress('')
             if self.fullHRUsWanted:
                 self.progress('Creating FullHRUs shapes ...')
-                hruShapes.finish()
+                hruShapes.finish(lambda: QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents))
                 #QSWATUtils.loginfo(hruShapes.makeString())
                 self.progress('Writing FullHRUs shapes ...')
                 if not self.createFullHRUsShapefile(hruShapes, subbasinChannelLandscapeCropSoilSlopeNumbers, progressBar, lastHru):
@@ -1588,6 +1588,7 @@ class CreateHRUs(QObject):
                                         return False
                                     if progressCount == fivePercent:
                                         progressBar.setValue(progressBar.value() + 5)
+                                        QCoreApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                                         progressCount = 1
                                     else:
                                         progressCount += 1

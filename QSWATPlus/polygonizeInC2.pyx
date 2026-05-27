@@ -578,14 +578,15 @@ cdef class Polygonize:
 #         for poly in self.polygons.values():
 #             self.fw.writeFlush(str(poly))
                             
-    cpdef finish(self):
-        """Coalesce all polygons.  Collect polygons for each value into a shape."""
+    cpdef finish(self, object callback=None):
+        """Coalesce all polygons.  Collect polygons for each value into a shape.
+        callback, if provided, is called every 50 shapes for UI event processing."""
         cdef:
-            Polygon poly 
-            Shape shape 
-            int val, i
+            Polygon poly
+            Shape shape
+            int val, i, count
             Vertex v1, v2
-            
+
         # add links for final row
         for i in range(1, self.length-1):
             thisVal = self.thisVals[i]
@@ -594,9 +595,13 @@ cdef class Polygonize:
                 v1 = Vertex(colNum+1, self.rowNum+1)
                 v2 = Vertex(colNum, self.rowNum+1)
                 self.shapes[thisVal].addLink(self.thisIds[i], v1, v2)
-                
+
+        count = 0
         for shape in self.shapes.values():
             shape.coalesce()
+            count += 1
+            if callback is not None and count % 50 == 0:
+                callback()
             
         #self.fw.writeFlush(self.shapesToString())
             
