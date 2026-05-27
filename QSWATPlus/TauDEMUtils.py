@@ -23,11 +23,16 @@
 from qgis.PyQt.QtCore import Qt, QSettings
 from qgis.PyQt.QtGui import QTextCursor
 from qgis.PyQt.QtWidgets import QTextEdit
-from qgis.core import QgsProject
+from qgis.core import QgsProject, QgsVectorLayer
+import math
+import os
 import os.path
 import subprocess
+import time
 import webbrowser
 from typing import Optional, List, Tuple
+import numpy as np
+from osgeo import gdal
 
 from .QSWATUtils import QSWATUtils  # type: ignore
 from .parameters import Parameters  # type: ignore
@@ -45,9 +50,297 @@ class TauDEMUtils:
         return TauDEMUtils.run('pitremove', inFiles, [], [('-fel', felFile)], numProcesses, output, False)
 
     @staticmethod
+    def agreeFlatConditioning(felFile: str, streamFile: str, epsilon: float = 1.0) -> None:
+        """Condition flat cells in pitfilled DEM to route toward the reference stream network.
+
+        TauDEM's flat-cell resolution iterates in platform-dependent order, producing different
+        D8 flow directions on ARM64 vs x86_64.  This function applies an AGREE-style gradient
+        to flat cells (cells with no strictly lower neighbour): flat cells closer to the
+        reference stream network are lowered by more (up to epsilon metres), guiding D8 routing
+        toward the channels regardless of platform.  The file is rewritten as Float32.
+        """
+        if not os.path.exists(felFile):
+            return
+        ds = gdal.Open(felFile, gdal.GA_ReadOnly)
+        if ds is None:
+            return
+        band = ds.GetRasterBand(1)
+        nodata = band.GetNoDataValue()
+        nCols = ds.RasterXSize
+        nRows = ds.RasterYSize
+        geotransform = ds.GetGeoTransform()
+        projection = ds.GetProjection()
+        data = band.ReadAsArray().astype(np.float32)
+        ds = None
+
+        valid = np.ones((nRows, nCols), dtype=bool)
+        if nodata is not None:
+            valid = ~np.isclose(data, np.float32(nodata))
+
+        # Rasterize stream lines onto the felFile grid using Bresenham's algorithm
+        stream_mask = np.zeros((nRows, nCols), dtype=bool)
+        ox, px, _, oy, _, py = geotransform  # ox=origin_x, px=pixel_w, oy=origin_y, py=pixel_h (negative)
+        streamLayer = QgsVectorLayer(streamFile, 'AGREE', 'ogr')
+        for reach in streamLayer.getFeatures():
+            geom = reach.geometry()
+            lines = geom.asMultiPolyline() if geom.isMultipart() else [geom.asPolyline()]
+            for line in lines:
+                for i in range(len(line) - 1):
+                    p0 = line[i]
+                    x0 = int((p0.x() - ox) / px)
+                    y0 = int((p0.y() - oy) / py)
+                    p1 = line[i + 1]
+                    x1 = int((p1.x() - ox) / px)
+                    y1 = int((p1.y() - oy) / py)
+                    steep = abs(y1 - y0) > abs(x1 - x0)
+                    if steep:
+                        x0, y0 = y0, x0
+                        x1, y1 = y1, x1
+                    if x0 > x1:
+                        x0, x1 = x1, x0
+                        y0, y1 = y1, y0
+                    dx, dy = x1 - x0, abs(y1 - y0)
+                    err, y, ystep = 0, y0, (1 if y0 < y1 else -1)
+                    for x in range(x0, x1 + 1):
+                        if steep:
+                            if 0 <= x < nRows and 0 <= y < nCols:
+                                stream_mask[x, y] = True
+                        else:
+                            if 0 <= x < nCols and 0 <= y < nRows:
+                                stream_mask[y, x] = True
+                        err += dy
+                        if 2 * err >= dx:
+                            y += ystep
+                            err -= dx
+
+        stream_init = stream_mask & valid
+        if not np.any(stream_init):
+            QSWATUtils.loginfo('agreeFlatConditioning: no stream cells found in {0}'.format(streamFile))
+            return
+
+        # Find flat cells: valid cells with no strictly lower valid neighbour
+        padded = np.pad(data, 1, constant_values=np.finfo(np.float32).max)
+        min_nbr = np.minimum.reduce([
+            padded[:-2, :-2], padded[:-2, 1:-1], padded[:-2, 2:],
+            padded[1:-1, :-2],                    padded[1:-1, 2:],
+            padded[2:,   :-2], padded[2:,  1:-1], padded[2:,  2:]
+        ])
+        is_flat = valid & ~stream_init & (min_nbr >= data)
+        flat_count = int(np.sum(is_flat))
+        if flat_count == 0:
+            return
+
+        # BFS distance from stream cells using numpy ring expansion (no scipy needed)
+        dist = np.full((nRows, nCols), -1, dtype=np.int32)
+        dist[stream_init] = 0
+        frontier = stream_init.copy()
+        step = 0
+        while np.any(frontier):
+            step += 1
+            expanded = np.zeros((nRows, nCols), dtype=bool)
+            expanded[:-1, :] |= frontier[1:, :]
+            expanded[1:, :] |= frontier[:-1, :]
+            expanded[:, :-1] |= frontier[:, 1:]
+            expanded[:, 1:] |= frontier[:, :-1]
+            expanded[:-1, :-1] |= frontier[1:, 1:]
+            expanded[:-1, 1:] |= frontier[1:, :-1]
+            expanded[1:, :-1] |= frontier[:-1, 1:]
+            expanded[1:, 1:] |= frontier[:-1, :-1]
+            new_cells = expanded & valid & (dist < 0)
+            if not np.any(new_cells):
+                break
+            dist[new_cells] = step
+            frontier = new_cells
+            # Early exit once all flat cells have been reached
+            if not np.any(is_flat & (dist < 0)):
+                break
+
+        # Cells still at dist=-1 are unreachable from the stream network; skip them
+        reachable_flat = is_flat & (dist > 0)
+        if not np.any(reachable_flat):
+            QSWATUtils.loginfo('agreeFlatConditioning: no reachable flat cells near streams')
+            return
+
+        max_dist = int(dist[reachable_flat].max())
+        if max_dist == 0:
+            return
+
+        # Lower flat cells by (1 - dist/max_dist) * epsilon: cells nearest stream are lowered most
+        norm_dist = np.minimum(dist.astype(np.float32) / max_dist, 1.0)
+        gradient = ((1.0 - norm_dist) * epsilon).astype(np.float32)
+        data[reachable_flat] -= gradient[reachable_flat]
+
+        # Recreate felFile as Float32 so sub-metre gradient values survive storage
+        driver = gdal.GetDriverByName('GTiff')
+        tmp = felFile + '.agree.tif'
+        out_ds = driver.Create(tmp, nCols, nRows, 1, gdal.GDT_Float32)
+        if out_ds is None:
+            QSWATUtils.loginfo('agreeFlatConditioning: could not create temp file')
+            return
+        out_ds.SetGeoTransform(geotransform)
+        out_ds.SetProjection(projection)
+        out_band = out_ds.GetRasterBand(1)
+        if nodata is not None:
+            out_band.SetNoDataValue(nodata)
+        out_band.WriteArray(data)
+        out_ds.FlushCache()
+        out_ds = None
+        os.replace(tmp, felFile)
+        QSWATUtils.loginfo('agreeFlatConditioning: conditioned {0} flat cells (max dist {1}) in {2}'.format(
+            int(np.sum(reachable_flat)), max_dist, felFile))
+
+    @staticmethod
+    def conditionFlatStreamCells(felFile: str, streamFile: str, isBatch: bool) -> None:
+        """Add a tiny stream-direction gradient to flat channel cells in the pit-filled DEM.
+
+        pitremove fills depressions in the burned channel to a uniform 'spill elevation',
+        creating flat patches on the channel.  TauDEM's flat-cell resolution resolves these
+        with platform-dependent iteration order (ARM64 vs x86_64 diverge).
+
+        This function applies a sub-centimetre gradient only to flat cells that lie on the
+        reference stream: cells at the downstream end of each flat patch are lowered slightly
+        more than cells at the upstream end, giving TauDEM a clear gradient to follow.
+        Non-channel flat cells (plains, lakes) are left untouched so accumulation routing
+        outside the reference stream is not disturbed.
+        """
+        from scipy.ndimage import label as ndlabel
+        start = time.process_time()
+
+        felDs = gdal.Open(felFile, gdal.GA_Update)
+        if felDs is None:
+            QSWATUtils.loginfo('conditionFlatStreamCells: cannot open {0}'.format(felFile))
+            return
+        felBand = felDs.GetRasterBand(1)
+        felNodata = felBand.GetNoDataValue()
+        projection = felDs.GetProjection()
+        geotransform = felDs.GetGeoTransform()
+        nRows = felDs.RasterYSize
+        nCols = felDs.RasterXSize
+        ox, px, _, oy, _, py = geotransform
+        fel = felBand.ReadAsArray().astype(np.float64)
+
+        nodata_mask = np.zeros((nRows, nCols), dtype=bool)
+        if felNodata is not None:
+            nodata_mask = (np.abs(fel - float(felNodata)) < 1.0)
+
+        # Flat cells: those where the 3x3 neighbourhood has identical min and max
+        padded = np.pad(fel, 1, constant_values=np.finfo(np.float64).max)
+        min_nbr = np.minimum.reduce([
+            padded[:-2, :-2], padded[:-2, 1:-1], padded[:-2, 2:],
+            padded[1:-1, :-2],                    padded[1:-1, 2:],
+            padded[2:,   :-2], padded[2:,  1:-1], padded[2:,  2:]
+        ])
+        padded_max = np.pad(fel, 1, constant_values=-np.finfo(np.float64).max)
+        max_nbr = np.maximum.reduce([
+            padded_max[:-2, :-2], padded_max[:-2, 1:-1], padded_max[:-2, 2:],
+            padded_max[1:-1, :-2],                        padded_max[1:-1, 2:],
+            padded_max[2:,   :-2], padded_max[2:,  1:-1], padded_max[2:,  2:]
+        ])
+        flat_mask = (~nodata_mask) & (max_nbr == min_nbr)
+
+        # Rasterize reference stream; record normalised flow-direction vector per cell
+        stream_dc = np.zeros((nRows, nCols), dtype=np.float64)  # east = +
+        stream_dr = np.zeros((nRows, nCols), dtype=np.float64)  # south = +
+        stream_on_grid = np.zeros((nRows, nCols), dtype=bool)
+
+        streamLayer = QgsVectorLayer(streamFile, 'FlatCond', 'ogr')
+        for reach in streamLayer.getFeatures():
+            geom = reach.geometry()
+            lines = geom.asMultiPolyline() if geom.isMultipart() else [geom.asPolyline()]
+            for line in lines:
+                for i in range(len(line) - 1):
+                    p0, p1 = line[i], line[i + 1]
+                    x0 = int((p0.x() - ox) / px)
+                    y0 = int((p0.y() - oy) / py)
+                    x1 = int((p1.x() - ox) / px)
+                    y1 = int((p1.y() - oy) / py)
+                    raw_dc = float(x1 - x0)
+                    raw_dr = float(y1 - y0)
+                    seg_len = math.sqrt(raw_dc ** 2 + raw_dr ** 2)
+                    if seg_len < 0.5:
+                        continue
+                    norm_dc = raw_dc / seg_len
+                    norm_dr = raw_dr / seg_len
+                    steep = abs(y1 - y0) > abs(x1 - x0)
+                    bx0, by0, bx1, by1 = x0, y0, x1, y1
+                    if steep:
+                        bx0, by0 = by0, bx0
+                        bx1, by1 = by1, bx1
+                    if bx0 > bx1:
+                        bx0, bx1 = bx1, bx0
+                        by0, by1 = by1, by0
+                    dx, dy_b = bx1 - bx0, abs(by1 - by0)
+                    err, by, bystep = 0, by0, (1 if by0 < by1 else -1)
+                    for bx in range(bx0, bx1 + 1):
+                        r, c = (bx, by) if steep else (by, bx)
+                        if 0 <= r < nRows and 0 <= c < nCols:
+                            stream_on_grid[r, c] = True
+                            stream_dc[r, c] = norm_dc
+                            stream_dr[r, c] = norm_dr
+                        err += dy_b
+                        if 2 * err >= dx:
+                            by += bystep
+                            err -= dx
+
+        # Flat stream cells: the only cells we will modify
+        flat_stream = flat_mask & stream_on_grid
+        n_flat_stream = int(flat_stream.sum())
+        if n_flat_stream == 0:
+            felDs = None
+            return
+
+        # For each connected component of flat stream cells, apply a gradient
+        # in the local stream-flow direction so TauDEM gets a clear slope.
+        # Gradient magnitude: 0.001 m per cell (1 mm) — large enough for Float32,
+        # small enough not to interfere with the broader topography.
+        epsilon = 0.001
+
+        labeled, n_comp = ndlabel(flat_stream)
+        rows_arr, cols_arr = np.where(flat_stream)
+        # Pre-build index arrays per component
+        comp_ids = labeled[rows_arr, cols_arr]
+
+        modified_count = 0
+        for cid in range(1, n_comp + 1):
+            sel = (comp_ids == cid)
+            crows = rows_arr[sel]
+            ccols = cols_arr[sel]
+            # Local flow direction for this component (average of cell directions)
+            dc_mean = stream_dc[crows, ccols].mean()
+            dr_mean = stream_dr[crows, ccols].mean()
+            norm = math.sqrt(dc_mean ** 2 + dr_mean ** 2)
+            if norm < 1e-6:
+                continue
+            dc_mean /= norm
+            dr_mean /= norm
+            # Project each cell onto the flow axis: downstream = higher projection
+            proj = dc_mean * ccols + dr_mean * crows  # scalar dot with position
+            proj_min = proj.min()
+            proj_max = proj.max()
+            if proj_max <= proj_min:
+                continue
+            # Downstream cells (high proj) get lowered by up to epsilon
+            # Upstream cells (low proj) get lowered by 0
+            frac = (proj - proj_min) / (proj_max - proj_min)  # 0=upstream, 1=downstream
+            lowering = frac * epsilon
+            fel[crows, ccols] -= lowering
+            modified_count += len(crows)
+
+        if modified_count > 0:
+            felBand.WriteArray(fel.astype(np.float32))
+            felDs.FlushCache()
+
+        felDs = None
+        finish = time.process_time()
+        QSWATUtils.loginfo(
+            'conditionFlatStreamCells: gradient applied to {0} flat stream cells '
+            '({1} components) in {2}ms'.format(
+                modified_count, n_comp, int((finish - start) * 1000)))
+
+    @staticmethod
     def runD8FlowDir(felFile: str, sd8File: str, pFile: str, numProcesses: int, output: Optional[QTextEdit]) -> bool:
         """Run D8FlowDir."""
-        return TauDEMUtils.run('d8flowdir', [('-fel', felFile)], [], [('-sd8', sd8File), ('-p', pFile)], 
+        return TauDEMUtils.run('d8flowdir', [('-fel', felFile)], [], [('-sd8', sd8File), ('-p', pFile)],
                                numProcesses, output, False)
 
     @staticmethod
@@ -229,7 +522,7 @@ class TauDEMUtils:
         # In windows PROJ seems to need ` instead of the more recent PROJ_DATA
         # In windows gdalplugins now stored under TauDEMDir so they are compatible with gdal304 dlls stored there
         MacPrefixNeeded = Parameters._ISMAC
-        MacPrefix = 'export DYLD_FALLBACK_LIBRARY_PATH={0}/Contents/Frameworks; export PROJ_LIB={0}/Contents/Resources/qgis/proj; '.format(Parameters._MACQGISDIR)
+        MacPrefix = 'export GDAL_DATA=/opt/homebrew/share/gdal; export PROJ_LIB=/opt/homebrew/share/proj; export GDAL_PAM_ENABLED=NO; '
         procCommand = commands if Parameters._ISWIN else MacPrefix + command if MacPrefixNeeded else command
         if Parameters._ISMAC:
             QSWATUtils.loginfo(procCommand)

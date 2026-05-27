@@ -1899,17 +1899,19 @@ assumed that its crossing the lake boundary is an inaccuracy.
         depmask = QSWATUtils.join(baseDir, 'depmask.tif')
         if not os.path.isfile(depmask):
             depmask = None
-        ok = TauDEMUtils.runPitFill(delineationDem, depmask, felFile, numProcesses, self._dlg.taudemOutput)   
+        ok = TauDEMUtils.runPitFill(delineationDem, depmask, felFile, numProcesses, self._dlg.taudemOutput)
         if not ok:
             self.cleanUp(3)
             return
         self._gv.felFile = felFile
+        if self._dlg.checkBurn.isChecked() and burnFile:
+            TauDEMUtils.conditionFlatStreamCells(felFile, burnFile, self._gv.isBatch)
         sd8File = base + 'sd8' + suffix
         pFile = base + 'p' + suffix
         QSWATUtils.removeLayer(sd8File, root)
         QSWATUtils.removeLayer(pFile, root)
         self.progress('D8FlowDir ...')
-        ok = TauDEMUtils.runD8FlowDir(felFile, sd8File, pFile, numProcesses, self._dlg.taudemOutput)   
+        ok = TauDEMUtils.runD8FlowDir(felFile, sd8File, pFile, numProcesses, self._dlg.taudemOutput)
         if not ok:
             self.cleanUp(3)
             return

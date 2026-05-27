@@ -25,6 +25,7 @@ from qgis.PyQt.QtCore import QSettings  # @UnresolvedImport
 from qgis.core import QgsCoordinateReferenceSystem, QgsUnitTypes, QgsCoordinateTransform, QgsProject, QgsFeatureRequest, QgsField, QgsFeature, QgsVectorLayer, QgsPointXY, QgsRasterLayer, QgsExpression, QgsGeometry, QgsVectorDataProvider, QgsRectangle, QgsLayerTreeGroup,  QgsLayerTreeLayer, NULL  # @UnresolvedImport
 from osgeo import gdal  # type: ignore
 import math
+import numpy as np
 from numpy import array, ndarray, zeros
 import os.path
 import time
@@ -4271,29 +4272,65 @@ class QSWATTopology:
             # QSWATUtils.error(u'Calculator  failed', self._gv.isBatch)
             return False
       
-    @staticmethod      
+    @staticmethod
     def burnStream(streamFile: str, demFile: str, burnFile: str, depth: float, verticalFactor: float, isBatch: bool) -> None:
-        """Create as burnFile a copy of demFile with points on lines streamFile reduced in height by depth metres."""
-        # use vertical factor to convert from metres to vertical units of DEM
-        demReduction = float(depth) / verticalFactor 
+        """Create burnFile: demFile with stream cells burned in, written as Float32.
+
+        Stream cells are lowered by the full depth plus a tiny longitudinal gradient
+        (0.0001 m per rasterised cell along the stream).  This gradient ensures no two
+        adjacent stream cells have the same elevation, so TauDEM D8FlowDir never needs
+        to resolve flat ties *along the channel* — the main cause of ARM64 vs x86_64
+        stream fragmentation on flat terrain.
+
+        A 5-ring BFS transverse gradient (ring 1: 5/6 depth … ring 5: 1/6 depth) is
+        also applied around the channel for a smooth valley cross-section.
+
+        The output is always Float32, regardless of the input DEM type, so sub-metre
+        burn values survive storage and TauDEM PitRemove sees a properly sloped channel.
+        """
+        demReduction = float(depth) / verticalFactor
         assert not os.path.exists(burnFile)
         demDs = gdal.Open(demFile, gdal.GA_ReadOnly)
+        srcBand = demDs.GetRasterBand(1)
+        nodata = srcBand.GetNoDataValue()
+        geotransform = demDs.GetGeoTransform()
+        projection = demDs.GetProjection()
+        nCols = demDs.RasterXSize
+        nRows = demDs.RasterYSize
+        raw = srcBand.ReadAsArray()
+        data = raw.astype(np.float64)
+        del raw
+        demDs = None
+
+        # Create Float32 output (never int16) so sub-metre gradients survive storage
         driver = gdal.GetDriverByName('GTiff')
-        burnDs = driver.CreateCopy(burnFile, demDs, 0)
+        burnDs = driver.Create(burnFile, nCols, nRows, 1, gdal.GDT_Float32)
         if burnDs is None:
             QSWATUtils.error('Failed to create burned-in DEM {0}'.format(burnFile), isBatch)
             return
-        demDs = None
-        QSWATUtils.copyPrj(demFile, burnFile)
+        burnDs.SetGeoTransform(geotransform)
+        burnDs.SetProjection(projection)
         band = burnDs.GetRasterBand(1)
-        nodata = band.GetNoDataValue()
-        burnTransform = burnDs.GetGeoTransform()
+        if nodata is not None:
+            band.SetNoDataValue(nodata)
+        QSWATUtils.copyPrj(demFile, burnFile)
+
+        burnTransform = geotransform
+        if nodata is not None:
+            nodata_mask = (data == nodata)
+        else:
+            nodata_mask = np.zeros((nRows, nCols), dtype=bool)
+
+        # Build stream cell mask + per-cell counter for longitudinal gradient.
+        # The Bresenham swap (x0 > x1) reverses the traversal order relative to the
+        # p0→p1 direction.  We detect the swap and reverse the collected cell list so
+        # the counter always increases in the p0→p1 (intended) direction.
+        stream_mask = np.zeros((nRows, nCols), dtype=bool)
+        stream_counter = np.zeros((nRows, nCols), dtype=np.float64)
         streamLayer = QgsVectorLayer(streamFile, 'Burn in streams', 'ogr')
         start = time.process_time()
-        countHits = 0
         countPoints = 0
-        countChanges = 0
-        changed: Dict[int, List[int]] = dict()
+        total_cells = 0
         for reach in streamLayer.getFeatures():
             geometry = reach.geometry()
             if geometry.isMultipart():
@@ -4304,63 +4341,94 @@ class QSWATTopology:
                 for i in range(len(line) - 1):
                     countPoints += 1
                     p0 = line[i]
-                    px0 = p0.x()
-                    py0 = p0.y()
-                    x0, y0 = QSWATTopology.projToCell(px0, py0, burnTransform)
+                    x0, y0 = QSWATTopology.projToCell(p0.x(), p0.y(), burnTransform)
                     p1 = line[i+1]
-                    px1 = p1.x()
-                    py1 = p1.y()
-                    x1, y1 = QSWATTopology.projToCell(px1, py1, burnTransform)
+                    x1, y1 = QSWATTopology.projToCell(p1.x(), p1.y(), burnTransform)
                     steep = abs(y1 - y0) > abs(x1 - x0)
                     if steep:
                         x0, y0 = y0, x0
                         x1, y1 = y1, x1
-                    if x0 > x1:
+                    swap_occurred = (x0 > x1)
+                    if swap_occurred:
                         x0, x1 = x1, x0
                         y0, y1 = y1, y0
                     deltax = x1 - x0
                     deltay = abs(y1 - y0)
                     err = 0
-                    deltaerr = deltay
                     y = y0
                     ystep = 1 if y0 < y1 else -1
-                    arr: ndarray[float] = array([[0.0]])
-                    for x in range(x0, x1+1):
+                    seg_cells = []
+                    for x in range(x0, x1 + 1):
                         if steep:
-                            if QSWATTopology.addPointToChanged(changed, y, x):
-                                # read can raise exception if coordinates outside extent
-                                try:
-                                    arr = band.ReadAsArray(y, x, 1, 1)
-                                    # arr may be none if stream map extends outside DEM extent
-                                    if arr and arr[0,0] != nodata:
-                                        arr[0,0] = arr[0,0] - demReduction
-                                        band.WriteArray(arr, y, x)
-                                        countChanges += 1
-                                except:
-                                    pass
-                            else:
-                                countHits += 1
+                            if 0 <= x < nRows and 0 <= y < nCols:
+                                seg_cells.append((x, y))
                         else:
-                            if QSWATTopology.addPointToChanged(changed, x, y):
-                                # read can raise exception if coordinates outside extent
-                                try:
-                                    arr = band.ReadAsArray(x, y, 1, 1)
-                                    # arr may be none if stream map extends outside DEM extent
-                                    if arr and arr[0,0] != nodata:
-                                        arr[0,0] = arr[0,0] - demReduction
-                                        band.WriteArray(arr, x, y)
-                                        countChanges += 1
-                                except:
-                                    pass   
-                            else:
-                                countHits += 1
-                        err += deltaerr
-                        if 2 * err < deltax:
-                            continue
-                        y += ystep
-                        err -= deltax
+                            if 0 <= x < nCols and 0 <= y < nRows:
+                                seg_cells.append((y, x))
+                        err += deltay
+                        if 2 * err >= deltax:
+                            y += ystep
+                            err -= deltax
+                    if swap_occurred:
+                        seg_cells = seg_cells[::-1]
+                    for (r, c) in seg_cells:
+                        stream_mask[r, c] = True
+                        stream_counter[r, c] = total_cells
+                        total_cells += 1
+
+        # Compute burn amounts
+        numRings = 10  # 10 rings × 30m = 300m buffer
+        burn_amount = np.zeros((nRows, nCols), dtype=np.float64)
+        stream_valid = stream_mask & ~nodata_mask
+        # Primary gradient: elevation-based.  Downstream cells have lower DEM elevation,
+        # so (max_elev - cell_elev) is larger → more burn → lower absolute elevation → correct D8.
+        # This is topology-free and handles non-flat segments regardless of feature processing order.
+        if np.any(stream_valid):
+            max_stream_elev = float(data[stream_valid].max())
+            elev_extra = np.maximum(0.0, (max_stream_elev - data) * 0.001)
+        else:
+            max_stream_elev = 0.0
+            elev_extra = np.zeros((nRows, nCols), dtype=np.float64)
+        # Secondary gradient: swap-corrected counter (fallback for flat segments).
+        # 0.0001 m per cell — representable in float32 at typical SRTM elevations.
+        burn_amount[stream_valid] = demReduction + elev_extra[stream_valid] + stream_counter[stream_valid] * 0.0001
+
+        # Position-based sub-mm gradient for ring cells: breaks flat ties between
+        # cells at the same ring distance.  (r + 2c) * 1e-4 m ensures all 8 neighbours
+        # differ; max gradient across a 1000x1000 DEM is 0.3 m — negligible vs ring burns.
+        rows_grid = np.arange(nRows, dtype=np.float64).reshape(-1, 1)
+        cols_grid = np.arange(nCols, dtype=np.float64).reshape(1, -1)
+        pos_gradient = (rows_grid + 2.0 * cols_grid) * 1e-4  # broadcast to (nRows, nCols)
+
+        # BFS 10-ring transverse gradient around channel
+        frontier = stream_mask.copy()
+        all_marked = stream_mask | nodata_mask
+        for ring_idx in range(1, numRings + 1):
+            expanded = np.zeros((nRows, nCols), dtype=bool)
+            expanded[:-1, :] |= frontier[1:, :]
+            expanded[1:, :] |= frontier[:-1, :]
+            expanded[:, :-1] |= frontier[:, 1:]
+            expanded[:, 1:] |= frontier[:, :-1]
+            expanded[:-1, :-1] |= frontier[1:, 1:]
+            expanded[:-1, 1:] |= frontier[1:, :-1]
+            expanded[1:, :-1] |= frontier[:-1, 1:]
+            expanded[1:, 1:] |= frontier[:-1, :-1]
+            new_ring = expanded & ~all_marked
+            ring_fraction = (numRings + 1 - ring_idx) / float(numRings + 1)
+            burn_amount[new_ring] = demReduction * ring_fraction + pos_gradient[new_ring]
+            all_marked |= new_ring
+            frontier = new_ring
+
+        # Apply burns and write as Float32
+        data[~nodata_mask] -= burn_amount[~nodata_mask]
+        band.WriteArray(data.astype(np.float32))
+        burnDs.FlushCache()
         finish = time.process_time()
-        QSWATUtils.loginfo('Created burned-in DEM {0} in {1!s} milliseconds; {2!s} points; {3!s} hits; {4!s} changes'.format(burnFile, int((finish - start)*1000), countPoints, countHits, countChanges))
+        countStream = int(np.sum(stream_valid))
+        countTotal = int(np.sum(burn_amount > 0))
+        QSWATUtils.loginfo(
+            'Created burned-in DEM {0} (Float32) in {1!s} ms; {2!s} stream cells + {3!s} gradient buffer cells'.format(
+                burnFile, int((finish - start) * 1000), countStream, countTotal - countStream))
         
     @staticmethod
     def addPointToChanged(changed: Dict[int, List[int]], col: int, row: int) -> bool:

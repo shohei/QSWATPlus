@@ -3,7 +3,9 @@
 # QSWATPlus Mac プラグインを QGIS にインストール可能な .zip に固める。
 #
 # 使い方:
-#   ./package_mac.sh [出力先ディレクトリ]
+#   ./package_mac.sh [--install] [出力先ディレクトリ]
+#
+#   --install   ZIP 作成後、QGIS プラグインディレクトリに直接展開してインストールする
 #
 # 出力先を省略した場合はリポジトリルートに出力する。
 # .so (Cython 拡張) が未コンパイルの場合は終了コード 1 で中断する。
@@ -13,6 +15,19 @@
 #   2. macOS 上で実行すること
 
 set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# 引数解析
+# ---------------------------------------------------------------------------
+DO_INSTALL=0
+OUTPUT_ARG=""
+for arg in "$@"; do
+    if [[ "$arg" == "--install" ]]; then
+        DO_INSTALL=1
+    else
+        OUTPUT_ARG="$arg"
+    fi
+done
 
 # ---------------------------------------------------------------------------
 # パス定義
@@ -25,8 +40,11 @@ PLUGIN_NAME="QSWATPlusMac3_64"
 VERSION=$(grep "__version__" "$PLUGIN_SRC/QSWATPlusMain.py" \
           | head -1 | grep -oE "[0-9]+\.[0-9]+\.[0-9]+")
 
-OUTPUT_DIR="${1:-$REPO_ROOT}"
+OUTPUT_DIR="${OUTPUT_ARG:-$REPO_ROOT}"
 OUTPUT_ZIP="$OUTPUT_DIR/${PLUGIN_NAME}_${VERSION}.zip"
+
+# QGIS プラグインインストール先 (QGIS デフォルトプロファイル)
+QGIS_PLUGIN_DIR="$HOME/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins"
 
 # ---------------------------------------------------------------------------
 # 前提チェック
@@ -161,3 +179,25 @@ echo "=== パッケージ内容 ==="
     | head -60)
 echo "  ..."
 echo "合計ファイル数: $(cd "$WORK" && find "$PLUGIN_NAME" -type f | wc -l | tr -d ' ')"
+
+# ---------------------------------------------------------------------------
+# QGIS への直接インストール (--install 指定時)
+# ---------------------------------------------------------------------------
+if [[ $DO_INSTALL -eq 1 ]]; then
+    echo ""
+    echo ">>> QGIS プラグインディレクトリへインストールしています..."
+    INSTALL_DEST="$QGIS_PLUGIN_DIR/$PLUGIN_NAME"
+
+    # 既存インストールを退避
+    if [[ -d "$INSTALL_DEST" ]]; then
+        BACKUP="$INSTALL_DEST.bak"
+        rm -rf "$BACKUP"
+        mv "$INSTALL_DEST" "$BACKUP"
+        echo "  旧バージョンを退避: $(basename "$BACKUP")"
+    fi
+
+    mkdir -p "$QGIS_PLUGIN_DIR"
+    (cd "$QGIS_PLUGIN_DIR" && unzip -q "$OUTPUT_ZIP")
+    echo "  インストール先: $INSTALL_DEST"
+    echo ">>> QGIS を再起動してプラグインを有効化してください。"
+fi
