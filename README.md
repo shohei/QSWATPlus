@@ -1,4 +1,4 @@
-# QSWATPlus
+# QSWATPlus (**Ported to Mac**)
 
 QGIS plugin for creating inputs for SWAT+.
 
