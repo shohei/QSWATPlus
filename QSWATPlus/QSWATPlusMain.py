@@ -22,7 +22,7 @@
 # Import the PyQt and QGIS libraries
 from qgis.core import Qgis, QgsProject, QgsRasterLayer, QgsUnitTypes, QgsVectorLayer, QgsApplication # @UnresolvedImport
 from qgis.analysis import QgsNativeAlgorithms # @UnresolvedImport
-from qgis.PyQt.QtCore import QObject, QSettings, Qt, QTranslator, QFileInfo, QCoreApplication, qVersion # @UnresolvedImport
+from qgis.PyQt.QtCore import QObject, QSettings, Qt, QTranslator, QFileInfo, QCoreApplication, QThread, pyqtSignal, qVersion # @UnresolvedImport
 from qgis.PyQt.QtGui import QFontDatabase, QIcon, QFont # @UnresolvedImport
 from qgis.PyQt.QtWidgets import QApplication, QInputDialog, QMessageBox, QAction, QFileDialog # @UnresolvedImport
 import os
@@ -69,6 +69,19 @@ try:
     from .exporttable import ExportTable
 except Exception:
     QSWATUtils.loginfo('QSWAT+ failed to import {0}: {1}'.format(txt, traceback.format_exc()))
+
+class _EditorThread(QThread):
+    """Runs SWAT+ Editor in a background thread so QGIS stays responsive."""
+    editorClosed = pyqtSignal()
+
+    def __init__(self, cmd: str) -> None:
+        super().__init__()
+        self._cmd = cmd
+
+    def run(self) -> None:
+        subprocess.call(self._cmd, shell=True)
+        self.editorClosed.emit()
+
 
 class QSWATPlus(QObject):
     """QGIS plugin to prepare geographic data for SWAT+ Editor."""
@@ -151,6 +164,8 @@ class QSWATPlus(QObject):
         self.hrus = None
         ## visualise window
         self.vis = None
+        ## SWAT+ Editor background thread
+        self._editorThread = None
         
         # report QGIS version
         QSWATUtils.loginfo('QGIS version: {0}; QSWAT+ version: {1}'.format(Qgis.QGIS_VERSION, QSWATPlus.__version__))
@@ -789,7 +804,7 @@ class QSWATPlus(QObject):
                 root.insertGroup(i, group)
 
     def startEditor(self):
-        """Start the SWAT Editor, first setting its initial parameters."""
+        """Start the SWAT Editor in a background thread so QGIS stays responsive."""
         # self._gv.setSWATEditorParams()
         editor = self._gv.findSWATPlusEditor()
         if editor is None:
@@ -798,14 +813,21 @@ class QSWATPlus(QObject):
         if self._gv and self._gv.db and self._gv.db.conn:
             self._gv.db.conn.close()
             QSWATUtils.loginfo('Project database closed')
-        QSWATUtils.loginfo('Starting SWAT+ editor with command: "{0}" "{1}"'.format(editor, self._gv.db.dbFile))
-        subprocess.call('"{0}" "{1}"'.format(editor, self._gv.db.dbFile), shell=True)
+        cmd = '"{0}" "{1}"'.format(editor, self._gv.db.dbFile)
+        QSWATUtils.loginfo('Starting SWAT+ editor with command: {0}'.format(cmd))
+        self._editorThread = _EditorThread(cmd)
+        self._editorThread.editorClosed.connect(self._onEditorClosed)
+        self._editorThread.start()
+
+    def _onEditorClosed(self):
+        """Called on the main thread after SWAT+ Editor exits."""
         # reopen project database
         if self._gv and self._gv.db:
             self._gv.db.connectToProjectDatabase()
         if os.path.exists(QSWATUtils.join(self._gv.resultsDir, Parameters._OUTPUTDB)):
             self._odlg.visualiseLabel.setVisible(True)
             self._odlg.visualiseButton.setVisible(True)
+        self._editorThread = None
         
     def visualise(self):
         """Run visualise form."""
